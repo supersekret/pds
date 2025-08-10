@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -73,10 +74,29 @@ func getConfig() *Config {
 }
 
 func init() {
+	// Set up logging
+	logger.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+	logger.SetLevel(logrus.InfoLevel)
+
 	// Global flags
 	rootCmd.PersistentFlags().StringVarP(&hostname, "hostname", "H", "", "PDS hostname (overrides PDS_HOSTNAME env var)")
 	rootCmd.PersistentFlags().StringVarP(&adminPassword, "password", "p", "", "Admin password (overrides PDS_ADMIN_PASSWORD env var)")
 	rootCmd.PersistentFlags().StringVar(&protocol, "protocol", "", "Protocol (http/https, overrides PDS_PROTOCOL env var)")
+	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
+	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "Enable debug output")
+
+	// Set up pre-run hook to configure logging
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		if debug {
+			logger.SetLevel(logrus.DebugLevel)
+		} else if verbose {
+			logger.SetLevel(logrus.InfoLevel)
+		} else {
+			logger.SetLevel(logrus.WarnLevel)
+		}
+	}
 
 	// Add subcommands
 	rootCmd.AddCommand(accountCmd)
@@ -99,9 +119,14 @@ func getEnvOrDefault(key, defaultValue string) string {
 func makeRequest(config *Config, method, path string, body io.Reader, useAuth bool) (*http.Response, error) {
 	url := fmt.Sprintf("%s://%s%s", config.Protocol, config.Hostname, path)
 	
+	logger.Debugf("Making %s request to %s", method, url)
+	if useAuth {
+		logger.Debug("Using admin authentication")
+	}
+	
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	
 	if useAuth {
@@ -113,7 +138,13 @@ func makeRequest(config *Config, method, path string, body io.Reader, useAuth bo
 	}
 	
 	client := &http.Client{Timeout: 30 * time.Second}
-	return client.Do(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	
+	logger.Debugf("Response status: %d %s", resp.StatusCode, resp.Status)
+	return resp, nil
 }
 
 func generatePassword() string {
@@ -123,15 +154,19 @@ func generatePassword() string {
 }
 
 func listAccounts(config *Config) error {
+	logger.Infof("Listing accounts from %s://%s", config.Protocol, config.Hostname)
+	
 	// Get list of DIDs
 	resp, err := makeRequest(config, "GET", "/xrpc/com.atproto.sync.listRepos?limit=100", nil, false)
 	if err != nil {
-		return fmt.Errorf("failed to get repo list: %v", err)
+		return fmt.Errorf("failed to get repo list: %w", err)
 	}
 	defer resp.Body.Close()
 	
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("failed to get repo list: status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		logger.Errorf("Failed to get repo list. Status: %d, Response: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to get repo list: status %d. This endpoint doesn't require authentication - check if PDS is running at %s://%s", resp.StatusCode, config.Protocol, config.Hostname)
 	}
 	
 	var repoList RepoListResponse
@@ -170,20 +205,29 @@ func createAccount(config *Config, email, handle string) error {
 		return fmt.Errorf("email and handle are required")
 	}
 	
+	logger.Infof("Creating account for %s (%s)", handle, email)
+	
 	// Generate password
 	password := generatePassword()
+	logger.Debug("Generated password for new account")
 	
 	// Create invite code
+	logger.Debug("Creating invite code for account creation")
 	inviteReq := map[string]int{"useCount": 1}
 	reqBody, _ := json.Marshal(inviteReq)
 	
 	resp, err := makeRequest(config, "POST", "/xrpc/com.atproto.server.createInviteCode", bytes.NewBuffer(reqBody), true)
 	if err != nil {
-		return fmt.Errorf("failed to create invite code: %v", err)
+		return fmt.Errorf("failed to create invite code: %w", err)
 	}
 	defer resp.Body.Close()
 	
 	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		logger.Errorf("Failed to create invite code. Status: %d, Response: %s", resp.StatusCode, string(body))
+		if resp.StatusCode == 401 {
+			return fmt.Errorf("authentication failed creating invite code (status 401). Check admin credentials")
+		}
 		return fmt.Errorf("failed to create invite code: status %d", resp.StatusCode)
 	}
 	
@@ -231,15 +275,22 @@ func createAccount(config *Config, email, handle string) error {
 }
 
 func createInviteCode(config *Config) error {
+	logger.Infof("Creating invite code using admin credentials")
+	
 	reqBody := []byte(`{"useCount": 1}`)
 	
 	resp, err := makeRequest(config, "POST", "/xrpc/com.atproto.server.createInviteCode", bytes.NewBuffer(reqBody), true)
 	if err != nil {
-		return fmt.Errorf("failed to create invite code: %v", err)
+		return fmt.Errorf("failed to create invite code: %w", err)
 	}
 	defer resp.Body.Close()
 	
 	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		logger.Errorf("Failed to create invite code. Status: %d, Response: %s", resp.StatusCode, string(body))
+		if resp.StatusCode == 401 {
+			return fmt.Errorf("authentication failed (status 401). Check PDS_ADMIN_PASSWORD env var or --password flag")
+		}
 		return fmt.Errorf("failed to create invite code: status %d", resp.StatusCode)
 	}
 	
@@ -302,6 +353,9 @@ var (
 	hostname      string
 	adminPassword string
 	protocol      string
+	verbose       bool
+	debug         bool
+	logger        = logrus.New()
 )
 
 var rootCmd = &cobra.Command{
