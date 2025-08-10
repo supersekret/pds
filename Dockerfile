@@ -11,13 +11,17 @@ RUN pnpm install --production --frozen-lockfile > /dev/null
 # Uses assets from build stage to reduce build size
 FROM node:20.11-alpine3.18
 
-RUN apk add --update dumb-init
+RUN apk add --update dumb-init curl jq openssl bash util-linux
 
 # Avoid zombie processes, handle signal forwarding
 ENTRYPOINT ["dumb-init", "--"]
 
 WORKDIR /app
 COPY --from=build /app /app
+COPY ./pdsadmin /app/pdsadmin
+COPY ./pdsadmin.sh /usr/local/bin/pdsadmin
+COPY ./pdsadmin-local.sh /usr/local/bin/pdsadmin-local
+RUN chmod +x /usr/local/bin/pdsadmin /usr/local/bin/pdsadmin-local
 
 EXPOSE 3000
 ENV PDS_PORT=3000
