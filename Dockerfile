@@ -8,20 +8,26 @@ COPY ./service ./
 RUN corepack prepare --activate
 RUN pnpm install --production --frozen-lockfile > /dev/null
 
+# Build Go pdsadmin binary
+FROM docker.io/library/golang:1.21-alpine AS gobuild
+WORKDIR /src
+COPY go.mod go.sum* ./
+RUN go mod download
+COPY cmd/ ./cmd/
+RUN CGO_ENABLED=0 GOOS=linux go build -o pdsadmin ./cmd/pdsadmin
+
 # Uses assets from build stage to reduce build size
 FROM node:20.11-alpine3.18
 
-RUN apk add --update dumb-init curl jq openssl bash util-linux
+RUN apk add --update dumb-init
 
 # Avoid zombie processes, handle signal forwarding
 ENTRYPOINT ["dumb-init", "--"]
 
 WORKDIR /app
 COPY --from=build /app /app
-COPY ./pdsadmin /app/pdsadmin
-COPY ./pdsadmin.sh /usr/local/bin/pdsadmin
-COPY ./pdsadmin-local.sh /usr/local/bin/pdsadmin-local
-RUN chmod +x /usr/local/bin/pdsadmin /usr/local/bin/pdsadmin-local
+COPY --from=gobuild /src/pdsadmin /usr/local/bin/pdsadmin
+RUN chmod +x /usr/local/bin/pdsadmin
 
 EXPOSE 3000
 ENV PDS_PORT=3000
